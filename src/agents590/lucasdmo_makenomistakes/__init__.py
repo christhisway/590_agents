@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable, cast
+from typing import Any, cast
 
 from openai import AsyncOpenAI
-from openai.types.responses import ToolParam
+from openai.types.responses import (
+    Response,
+    ResponseInputItemParam,
+    ResponseOutputItem,
+    ToolParam,
+)
+from openai.types.responses.response_input_item_param import FunctionCallOutput
 
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
@@ -23,59 +30,63 @@ class MyAgent:
         """Prefer the per-run model to the environment's configured deployment."""
         return UNCOpenAISettings.from_env(model=context.model)
 
-    tools: list[ToolParam] = cast(list[ToolParam], [
-        {
-            "type": "function",
-            "name": "run_shell_command",
-            "description": "Run arbitrary shell command",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cmd": {
-                        "type": "string",
-                        "description": "Command to execute, ex. ls",
+    tools: list[ToolParam] = cast(
+        list[ToolParam],
+        [
+            {
+                "type": "function",
+                "name": "run_shell_command",
+                "description": "Run arbitrary shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": {
+                            "type": "string",
+                            "description": "Command to execute, ex. ls",
+                        },
                     },
+                    "required": ["cmd"],
                 },
-                "required": ["cmd"],
             },
-        },
-    ])
+        ],
+    )
 
     async def run(self, instruction: str, context: RunContext) -> str:
         self.settings = self.provider_settings(context)
         self.client = self.settings.create_async_client()
         self.orig_prompt = instruction
 
-        input_messages: list[str] = [instruction]
-        response = await self.call_model("\n".join(input_messages))
-        return await self.handle_response(input_messages, response.output, context.cwd)
+        response = await self.call_model(instruction)
+        return await self.handle_response([], response.output, context.cwd)
 
     async def handle_response(
         self,
-        old_input: list[str],
-        output: Iterable[Any],
+        old_input: list[ResponseInputItemParam],
+        output: Iterable[ResponseOutputItem],
         cwd: Path,
     ) -> str:
-        """Handle a response and continue the loop until a message completes."""
-        append_to_input: list[str] = []
+        """Handle a Responses result and continue until a message completes."""
+        output = list(output)
+        append_to_input: list[ResponseInputItemParam] = []
 
         for output_item in output:
             match output_item.type:
                 case "function_call":
-                    name: str = output_item.name
                     args: dict[str, Any] = json.loads(output_item.arguments)
-                    result = await self.call_function(name, args, cwd)
+                    result = await self.call_function(output_item.name, args, cwd)
                     append_to_input.append(
-                        str(
-                            {
-                                "type": "function_call_output",
-                                "call_id": output_item.call_id,
-                                "output": json.dumps(result),
-                            }
+                        FunctionCallOutput(
+                            type="function_call_output",
+                            call_id=output_item.call_id,
+                            output=json.dumps(result),
                         )
                     )
                 case "message":
-                    text = output_item.content[0].text
+                    text = "".join(
+                        part.text
+                        for part in output_item.content
+                        if part.type == "output_text"
+                    )
                     print(text)
                     if output_item.status == "completed":
                         return text
@@ -86,11 +97,17 @@ class MyAgent:
                     print(output_item.type)
                     print(output_item)
 
-        next_input = ["ORIGINAL PROMPT: " + self.orig_prompt, *old_input]
-        response = await self.call_model("\n".join(next_input + append_to_input))
-        return await self.handle_response(next_input + append_to_input, response.output, cwd)
+        prior_output = [
+            cast(ResponseInputItemParam, item.model_dump(exclude_none=True))
+            for item in output
+        ]
+        next_input = [*old_input, *prior_output, *append_to_input]
+        response = await self.call_model(next_input)
+        return await self.handle_response(next_input, response.output, cwd)
 
-    async def call_model(self, prompt: str) -> Any:
+    async def call_model(
+        self, prompt: str | list[ResponseInputItemParam]
+    ) -> Response:
         return await self.client.responses.create(
             model=self.settings.model,
             instructions="",
@@ -105,7 +122,7 @@ class MyAgent:
         name: str,
         args: dict[str, Any],
         cwd: Path,
-    ) -> Any:
+    ) -> str:
         if name == "run_shell_command":
             print("TOOL CALL: run shell command")
             print(args["cmd"])
