@@ -9,11 +9,12 @@ import pytest
 from openai import AsyncOpenAI
 from openai.types.responses import Response
 
+import agents590.webp_agent as webp_agent
 from agents590.contracts import RunContext
 from agents590.webp_agent import WebpAgent, run_shell
 
 
-def _response(output: list[dict[str, Any]]) -> Response:
+def _response(output: list[dict[str, Any]], usage: dict[str, Any] | None = None) -> Response:
     return Response.model_validate(
         {
             "id": "resp_test",
@@ -24,8 +25,19 @@ def _response(output: list[dict[str, Any]]) -> Response:
             "parallel_tool_calls": True,
             "tool_choice": "auto",
             "tools": [],
+            "usage": usage,
         }
     )
+
+
+def _usage(prompt: int, completion: int, cached: int) -> dict[str, Any]:
+    return {
+        "input_tokens": prompt,
+        "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": 0},
+        "output_tokens": completion,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": prompt + completion,
+    }
 
 
 def _shell_call(call_id: str, command: str) -> dict[str, Any]:
@@ -112,3 +124,59 @@ def test_run_shell_reports_failures_and_timeouts(tmp_path: Path) -> None:
     failed = asyncio.run(run_shell("echo oops >&2; exit 3", tmp_path))
     assert "exit_code: 3" in failed and "oops" in failed
     assert "timed out" in asyncio.run(run_shell("sleep 5", tmp_path, timeout=0.1))
+
+
+def test_each_iteration_appends_an_atif_step(tmp_path: Path) -> None:
+    path = tmp_path / "trajectory.json"
+    summary = [{"type": "summary_text", "text": "Look first."}]
+    reasoning = {"type": "reasoning", "id": "rs_1", "summary": summary}
+    malformed = _shell_call("call_2", "")
+    client = ScriptedClient(
+        [
+            _response([reasoning, _shell_call("call_1", "echo hi")], _usage(100, 20, 40)),
+            _response([{**malformed, "arguments": "not json"}], _usage(150, 10, 100)),
+            _response([_message("Done.")], _usage(200, 5, 150)),
+        ]
+    )
+    agent = WebpAgent(client=cast(AsyncOpenAI, client), trajectory_path=path)
+    asyncio.run(agent.run("Fix it", RunContext(cwd=tmp_path)))
+
+    trajectory = json.loads(path.read_text())
+    steps = trajectory["steps"]
+    assert trajectory["schema_version"] == "ATIF-v1.8"
+    assert trajectory["agent"]["name"] == "webp_agent"
+    assert [step["step_id"] for step in steps] == [1, 2, 3, 4, 5]
+    assert [step["source"] for step in steps] == ["system", "user", "agent", "agent", "agent"]
+    assert steps[1]["message"] == "Fix it"
+    first = steps[2]
+    assert first["reasoning_content"] == "Look first."
+    assert first["tool_calls"] == [
+        {"tool_call_id": "call_1", "function_name": "shell", "arguments": {"command": "echo hi"}}
+    ]
+    assert first["observation"]["results"][0]["source_call_id"] == "call_1"
+    assert "hi" in first["observation"]["results"][0]["content"]
+    assert steps[3]["tool_calls"][0]["arguments"] == {"raw": "not json"}
+    assert steps[4]["message"] == "Done." and "tool_calls" not in steps[4]
+    assert trajectory["final_metrics"] == {
+        "total_prompt_tokens": 450,
+        "total_completion_tokens": 35,
+        "total_cached_tokens": 290,
+        "total_steps": 5,
+    }
+    assert not (tmp_path / "trajectory.json.partial").exists()
+
+
+def test_trajectory_is_only_written_inside_harbor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(webp_agent, "HARBOR_AGENT_LOGS", tmp_path / "missing")
+    client = ScriptedClient([_response([_message("ok")])])
+    asyncio.run(WebpAgent(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path)))
+    assert list(tmp_path.iterdir()) == []
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(webp_agent, "HARBOR_AGENT_LOGS", logs)
+    client = ScriptedClient([_response([_message("ok")])])
+    asyncio.run(WebpAgent(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path)))
+    assert (logs / "trajectory.json").is_file()
