@@ -4,7 +4,7 @@
   "python.analysis.typeCheckingMode": "strict",
   "python.testing.pytestEnabled": true,
   "python.testing.unittestEnabled": false,
-  "python.testing.pytestArgs": ["tests"],
+  "python.testing.pytestArgs": ["tests", "src/agents590/webp_agent/tests"],
   "[python]": {
     "editor.defaultFormatter": "charliermarsh.ruff",
     "editor.formatOnSave": true,

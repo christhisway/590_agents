@@ -31,6 +31,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agents590"]
+exclude = ["src/agents590/**/tests"]
 
 [tool.ruff]
 target-version = "py312"
@@ -47,4 +48,4 @@ venvPath = "."
 venv = ".venv"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "src/agents590/webp_agent/tests"]
