@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import subprocess
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -26,8 +25,6 @@ from agents590.atif import (
 )
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
-
-logger = logging.getLogger(__name__)
 
 
 class MyAgent:
@@ -175,24 +172,6 @@ class MyAgent:
 
         if metrics is not None:
             self._update_final_metrics()
-            logger.info(
-                "ATIF token usage: response_id=%s model=%s prompt_tokens=%d "
-                "completion_tokens=%d cached_tokens=%d trajectory=%s",
-                getattr(response, "id", None),
-                self.settings.model,
-                metrics["prompt_tokens"],
-                metrics["completion_tokens"],
-                metrics["cached_tokens"],
-                self.recorder.path or "disabled",
-            )
-        else:
-            logger.warning(
-                "Responses API returned no usage; ATIF metrics were not recorded: "
-                "response_id=%s model=%s trajectory=%s",
-                getattr(response, "id", None),
-                self.settings.model,
-                self.recorder.path or "disabled",
-            )
 
     @staticmethod
     def _metrics(usage: object) -> ATIFMetrics | None:
