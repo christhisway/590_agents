@@ -9,6 +9,7 @@ from openai.types.responses import (
     Response,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
+    ResponseOutputItem,
     ResponseReasoningItem,
 )
 
@@ -97,6 +98,35 @@ async def _call_tool(name: str, arguments: str, cwd: Path) -> str:
     return await run_shell(command, cwd)
 
 
+async def _request(
+    client: AsyncOpenAI, model: str, system_prompt: str, transcript: list[ResponseInputItemParam]
+) -> Response:
+    """Ask for the next turn statelessly, carrying encrypted reasoning in the transcript."""
+    return await client.responses.create(
+        model=model,
+        instructions=system_prompt,
+        input=transcript,
+        tools=[SHELL_TOOL],
+        include=["reasoning.encrypted_content"],
+        store=False,
+        background=False,
+    )
+
+
+async def _run_calls(calls: list[ResponseFunctionToolCall], cwd: Path) -> list[tuple[str, str]]:
+    """Run each tool call in order and pair its output with the call's id."""
+    return [(call.call_id, await _call_tool(call.name, call.arguments, cwd)) for call in calls]
+
+
+def _as_input(item: ResponseOutputItem) -> ResponseInputItemParam:
+    """Replay a model output item verbatim so the next request keeps the full context."""
+    return cast(ResponseInputItemParam, item.model_dump(exclude_none=True))
+
+
+def _call_output(call_id: str, output: str) -> ResponseInputItemParam:
+    return {"type": "function_call_output", "call_id": call_id, "output": output}
+
+
 def _arguments_object(arguments: str) -> dict[str, Any]:
     """ATIF requires an object, so keep malformed model arguments under 'raw'."""
     try:
@@ -162,46 +192,26 @@ class WebpAgent:
             patient = client.with_options(timeout=REQUEST_TIMEOUT_SECONDS, max_retries=2)
             return await self._loop(patient, settings.model, instruction, context)
 
+    def _recorder(self, model: str) -> ATIFRecorder:
+        if self._trajectory_path is not None:
+            return ATIFRecorder(self._trajectory_path, agent="webp_agent", model=model)
+        return ATIFRecorder.from_environment(agent="webp_agent", model=model)
+
     async def _loop(
         self, client: AsyncOpenAI, model: str, instruction: str, context: RunContext
     ) -> str:
         system_prompt = SYSTEM_PROMPT.format(cwd=context.cwd)
-        recorder = (
-            ATIFRecorder(self._trajectory_path, agent="webp_agent", model=model)
-            if self._trajectory_path is not None
-            else ATIFRecorder.from_environment(agent="webp_agent", model=model)
-        )
+        recorder = self._recorder(model)
         recorder.add("system", system_prompt)
         recorder.add("user", instruction)
         transcript: list[ResponseInputItemParam] = [{"role": "user", "content": instruction}]
         for _ in range(MAX_STEPS):
-            # call model first
-            response: Response = await client.responses.create(
-                model=model,
-                instructions=system_prompt,
-                input=transcript,
-                tools=[SHELL_TOOL],
-                include=["reasoning.encrypted_content"],
-                store=False,
-                background=False,
-            )
-            # replays every output item to maintain context for the model between turns
-            for item in response.output:
-                transcript.append(cast(ResponseInputItemParam, item.model_dump(exclude_none=True)))
-            calls = [item for item in response.output if item.type == "function_call"]
-            # execute calls, if any
-            outputs: list[tuple[str, str]] = []
-            for call in calls:
-                output = await _call_tool(call.name, call.arguments, context.cwd)
-                outputs.append((call.call_id, output))
-                result: dict[str, Any] = {
-                    "type": "function_call_output",
-                    "call_id": call.call_id,
-                    "output": output,
-                }
-                transcript.append(cast(ResponseInputItemParam, result))
-            # log this iteration before looping again
+            response = await _request(client, model, system_prompt, transcript)
+            calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
+            outputs = await _run_calls(calls, context.cwd)
+            transcript += [_as_input(item) for item in response.output]
+            transcript += [_call_output(call_id, output) for call_id, output in outputs]
             _record_response(recorder, response, outputs)
-            if not calls:  # task finished, terminate
+            if not calls:
                 return response.output_text
         return f"Stopped after reaching the {MAX_STEPS}-step limit."
