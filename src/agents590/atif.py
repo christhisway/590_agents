@@ -105,7 +105,20 @@ class ATIFRecorder:
         # required in the TypedDict; extension values are still JSON-typed.
         step.update(fields)
         self.document["steps"].append(cast(ATIFStep, step))
+        if "metrics" in step or "final_metrics" in self.document:
+            self._update_final_metrics()
         self.write()
+
+    def _update_final_metrics(self) -> None:
+        """Total token usage once any step reports it, then keep the step count current."""
+        steps = self.document["steps"]
+        metrics = [step["metrics"] for step in steps if "metrics" in step]
+        self.document["final_metrics"] = {
+            "total_prompt_tokens": sum(m["prompt_tokens"] for m in metrics),
+            "total_completion_tokens": sum(m["completion_tokens"] for m in metrics),
+            "total_cached_tokens": sum(m["cached_tokens"] for m in metrics),
+            "total_steps": len(steps),
+        }
 
     def write(self) -> None:
         """Atomically write the latest valid trajectory, if recording is enabled."""

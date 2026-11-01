@@ -142,16 +142,6 @@ def _record_response(
         }
     recorder.add("agent", response.output_text, **fields)
 
-    steps = recorder.document["steps"]
-    metrics = [step["metrics"] for step in steps if "metrics" in step]
-    recorder.document["final_metrics"] = {
-        "total_prompt_tokens": sum(m["prompt_tokens"] for m in metrics),
-        "total_completion_tokens": sum(m["completion_tokens"] for m in metrics),
-        "total_cached_tokens": sum(m["cached_tokens"] for m in metrics),
-        "total_steps": len(steps),
-    }
-    recorder.write()
-
 
 class WebpAgent:
     """Loop between the model and a shell tool until the model stops calling tools."""
