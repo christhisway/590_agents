@@ -1,5 +1,7 @@
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -36,21 +38,6 @@ the task requires and preserve unrelated content exactly.
 Before finishing, verify your change by running it or its tests where possible. \
 When the task is complete, reply with a short summary and no tool call."""
 
-SHELL_TOOL: FunctionToolParam = {
-    "type": "function",
-    "name": "shell",
-    "description": "Run a bash command and return its exit code, stdout, and stderr.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "command": {"type": "string", "description": "The bash command to execute."},
-        },
-        "required": ["command"],
-        "additionalProperties": False,
-    },
-    "strict": True,
-}
-
 
 # added this on AI suggestion to improve token efficiency. keeps the first and last 10k chars of a
 # long shell output
@@ -86,16 +73,58 @@ async def run_shell(command: str, cwd: Path, timeout: float = COMMAND_TIMEOUT_SE
     )
 
 
-async def _call_tool(name: str, arguments: str, cwd: Path) -> str:
-    if name != "shell":
-        return f"Unknown tool {name!r}; the only tool is 'shell'."
-    try:
-        command = json.loads(arguments)["command"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return "Invalid arguments; expected a JSON object with a string 'command'."
+@dataclass(frozen=True)
+class Tool:
+    """A function tool's schema and the coroutine that runs it on parsed arguments."""
+
+    schema: FunctionToolParam
+    run: Callable[[dict[str, Any], Path], Awaitable[str]]
+
+
+async def _shell(arguments: dict[str, Any], cwd: Path) -> str:
+    command = arguments.get("command")
     if not isinstance(command, str):
         return "Invalid arguments; 'command' must be a string."
     return await run_shell(command, cwd)
+
+
+SHELL = Tool(
+    schema={
+        "type": "function",
+        "name": "shell",
+        "description": "Run a bash command and return its exit code, stdout, and stderr.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The bash command to execute."},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    run=_shell,
+)
+
+TOOLS: dict[str, Tool] = {tool.schema["name"]: tool for tool in [SHELL]}
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    try:
+        parsed: object = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
+
+
+async def _call_tool(name: str, arguments: str, cwd: Path) -> str:
+    tool = TOOLS.get(name)
+    if tool is None:
+        return f"Unknown tool {name!r}; available tools: {', '.join(TOOLS)}."
+    parsed = _json_object(arguments)
+    if parsed is None:
+        return "Invalid arguments; expected a JSON object."
+    return await tool.run(parsed, cwd)
 
 
 async def _request(
@@ -106,7 +135,7 @@ async def _request(
         model=model,
         instructions=system_prompt,
         input=transcript,
-        tools=[SHELL_TOOL],
+        tools=[tool.schema for tool in TOOLS.values()],
         include=["reasoning.encrypted_content"],
         store=False,
         background=False,
@@ -129,11 +158,8 @@ def _call_output(call_id: str, output: str) -> ResponseInputItemParam:
 
 def _arguments_object(arguments: str) -> dict[str, Any]:
     """ATIF requires an object, so keep malformed model arguments under 'raw'."""
-    try:
-        parsed: object = json.loads(arguments)
-    except json.JSONDecodeError:
-        parsed = None
-    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else {"raw": arguments}
+    parsed = _json_object(arguments)
+    return parsed if parsed is not None else {"raw": arguments}
 
 
 def _record_response(

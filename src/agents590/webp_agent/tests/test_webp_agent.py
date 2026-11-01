@@ -108,8 +108,10 @@ def test_loop_runs_shell_calls_in_cwd_and_returns_final_text(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     ("call", "expected"),
     [
-        ({**_shell_call("c", ""), "arguments": "not json"}, "Invalid arguments"),
-        ({**_shell_call("c", ""), "name": "python"}, "Unknown tool"),
+        ({**_shell_call("c", ""), "arguments": "not json"}, "expected a JSON object"),
+        ({**_shell_call("c", ""), "arguments": "[]"}, "expected a JSON object"),
+        ({**_shell_call("c", ""), "arguments": '{"command": 1}'}, "must be a string"),
+        ({**_shell_call("c", ""), "name": "python"}, "available tools: shell"),
     ],
 )
 def test_malformed_tool_calls_are_reported_to_the_model(
