@@ -163,7 +163,7 @@ def test_each_iteration_appends_an_atif_step(tmp_path: Path) -> None:
         "total_cached_tokens": 290,
         "total_steps": 5,
     }
-    assert not (tmp_path / "trajectory.json.partial").exists()
+    assert not (tmp_path / "trajectory.tmp").exists()
 
 
 def test_trajectory_is_only_written_inside_harbor(
@@ -180,3 +180,14 @@ def test_trajectory_is_only_written_inside_harbor(
     client = ScriptedClient([_response([_message("ok")])])
     asyncio.run(WebpAgent(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path)))
     assert (logs / "trajectory.json").is_file()
+
+
+def test_unwritable_trajectory_stops_the_run(tmp_path: Path) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("")
+    client = ScriptedClient([_response([_message("Done.")])])
+    agent = WebpAgent(client=cast(AsyncOpenAI, client), trajectory_path=blocker / "t.json")
+
+    with pytest.raises(OSError):
+        asyncio.run(agent.run("Fix it", RunContext(cwd=tmp_path)))
+    assert client.responses.requests == []
