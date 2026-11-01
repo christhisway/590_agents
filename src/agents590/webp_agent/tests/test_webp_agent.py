@@ -9,7 +9,7 @@ import pytest
 from openai import AsyncOpenAI
 from openai.types.responses import Response
 
-import agents590.webp_agent as webp_agent
+from agents590 import atif
 from agents590.contracts import RunContext
 from agents590.webp_agent import WebpAgent, run_shell
 
@@ -169,17 +169,26 @@ def test_each_iteration_appends_an_atif_step(tmp_path: Path) -> None:
 def test_trajectory_is_only_written_inside_harbor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(webp_agent, "HARBOR_AGENT_LOGS", tmp_path / "missing")
-    client = ScriptedClient([_response([_message("ok")])])
-    asyncio.run(WebpAgent(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path)))
+    def run_once() -> None:
+        client = ScriptedClient([_response([_message("ok")])])
+        agent = WebpAgent(client=cast(AsyncOpenAI, client))
+        asyncio.run(agent.run("x", RunContext(cwd=tmp_path)))
+
+    monkeypatch.delenv("AGENTS590_ATIF_PATH", raising=False)
+    monkeypatch.setattr(atif, "HARBOR_AGENT_LOGS", tmp_path / "missing")
+    run_once()
     assert list(tmp_path.iterdir()) == []
 
     logs = tmp_path / "logs"
     logs.mkdir()
-    monkeypatch.setattr(webp_agent, "HARBOR_AGENT_LOGS", logs)
-    client = ScriptedClient([_response([_message("ok")])])
-    asyncio.run(WebpAgent(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path)))
+    monkeypatch.setattr(atif, "HARBOR_AGENT_LOGS", logs)
+    run_once()
     assert (logs / "trajectory.json").is_file()
+
+    override = tmp_path / "override.json"
+    monkeypatch.setenv("AGENTS590_ATIF_PATH", str(override))
+    run_once()
+    assert override.is_file()
 
 
 def test_unwritable_trajectory_stops_the_run(tmp_path: Path) -> None:

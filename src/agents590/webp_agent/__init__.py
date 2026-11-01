@@ -21,10 +21,6 @@ COMMAND_TIMEOUT_SECONDS = 120.0
 MAX_OUTPUT_CHARS = 20_000
 REQUEST_TIMEOUT_SECONDS = 300.0
 
-# Harbor bind-mounts this container directory to the trial's agent/ logs folder and
-# shows agent/trajectory.json (ATIF format) in its Trajectory viewer.
-HARBOR_AGENT_LOGS = Path("/logs/agent")
-
 # not sure if this is even necessary but it couldn't hurt
 SYSTEM_PROMPT = """\
 You are an autonomous coding agent working in a Linux or macOS shell. Nobody will \
@@ -157,11 +153,6 @@ def _record_response(
     recorder.write()
 
 
-def _default_trajectory_path() -> Path | None:
-    """Log only inside a Harbor sandbox, where the agent logs directory exists."""
-    return HARBOR_AGENT_LOGS / "trajectory.json" if HARBOR_AGENT_LOGS.is_dir() else None
-
-
 class WebpAgent:
     """Loop between the model and a shell tool until the model stops calling tools."""
 
@@ -169,7 +160,7 @@ class WebpAgent:
         self, client: AsyncOpenAI | None = None, trajectory_path: Path | None = None
     ) -> None:
         self._client = client
-        self._trajectory_path = trajectory_path or _default_trajectory_path()
+        self._trajectory_path = trajectory_path
 
     async def run(self, instruction: str, context: RunContext) -> str:
         settings = UNCOpenAISettings.from_env(model=context.model)
@@ -185,7 +176,11 @@ class WebpAgent:
         self, client: AsyncOpenAI, model: str, instruction: str, context: RunContext
     ) -> str:
         system_prompt = SYSTEM_PROMPT.format(cwd=context.cwd)
-        recorder = ATIFRecorder(self._trajectory_path, agent="webp_agent", model=model)
+        recorder = (
+            ATIFRecorder(self._trajectory_path, agent="webp_agent", model=model)
+            if self._trajectory_path is not None
+            else ATIFRecorder.from_environment(agent="webp_agent", model=model)
+        )
         recorder.add("system", system_prompt)
         recorder.add("user", instruction)
         transcript: list[ResponseInputItemParam] = [{"role": "user", "content": instruction}]

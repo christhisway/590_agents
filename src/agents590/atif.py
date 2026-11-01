@@ -13,6 +13,10 @@ from typing import NotRequired, TypedDict, cast
 # here prevents the recorder's public data model from falling back to ``Any``.
 type JSONValue = None | bool | int | float | str | list[JSONValue] | dict[str, JSONValue]
 
+# Harbor bind-mounts this container directory to the trial's agent/ logs folder and
+# shows agent/trajectory.json (ATIF format) in its Trajectory viewer.
+HARBOR_AGENT_LOGS = Path("/logs/agent")
+
 
 class ATIFAgent(TypedDict):
     name: str
@@ -82,12 +86,11 @@ class ATIFRecorder:
     @classmethod
     def from_environment(cls, *, agent: str, model: str) -> ATIFRecorder:
         configured = os.environ.get("AGENTS590_ATIF_PATH", "").strip()
-        # Harbor exposes /agent inside installed-agent containers. Keep
-        # ordinary local CLI runs side-effect free when that directory is absent.
+        # Keep ordinary local CLI runs side-effect free outside a Harbor sandbox.
         path = (
             Path(configured)
             if configured
-            else (Path("/agent/trajectory.json") if Path("/agent").is_dir() else None)
+            else (HARBOR_AGENT_LOGS / "trajectory.json" if HARBOR_AGENT_LOGS.is_dir() else None)
         )
         return cls(path, agent=agent, model=model)
 
