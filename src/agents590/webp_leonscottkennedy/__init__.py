@@ -215,7 +215,7 @@ def _record_response(
     recorder.add("agent", response.output_text, **fields)
 
 
-class WebpAgent:
+class LeonScottKennedy:
     """Loop between the model and a shell tool until the model stops calling tools."""
 
     def __init__(
@@ -236,8 +236,8 @@ class WebpAgent:
 
     def _recorder(self, model: str) -> ATIFRecorder:
         if self._trajectory_path is not None:
-            return ATIFRecorder(self._trajectory_path, agent="webp_agent", model=model)
-        return ATIFRecorder.from_environment(agent="webp_agent", model=model)
+            return ATIFRecorder(self._trajectory_path, agent="webp_leonscottkennedy", model=model)
+        return ATIFRecorder.from_environment(agent="webp_leonscottkennedy", model=model)
 
     async def _loop(
         self, client: AsyncOpenAI, model: str, instruction: str, context: RunContext

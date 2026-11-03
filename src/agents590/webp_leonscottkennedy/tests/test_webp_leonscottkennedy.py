@@ -1,4 +1,4 @@
-"""Exercise the webp_agent loop with a scripted client and real local shell commands."""
+"""Exercise the webp_leonscottkennedy loop with a scripted client and real local shell commands."""
 
 import asyncio
 import json
@@ -11,7 +11,7 @@ from openai.types.responses import Response
 
 from agents590 import atif
 from agents590.contracts import RunContext
-from agents590.webp_agent import WebpAgent, run_shell
+from agents590.webp_leonscottkennedy import LeonScottKennedy, run_shell
 
 
 def _response(output: list[dict[str, Any]], usage: dict[str, Any] | None = None) -> Response:
@@ -89,7 +89,7 @@ def test_loop_runs_shell_calls_in_cwd_and_returns_final_text(tmp_path: Path) -> 
             _response([_message("Done.")]),
         ]
     )
-    agent = WebpAgent(client=cast(AsyncOpenAI, client))
+    agent = LeonScottKennedy(client=cast(AsyncOpenAI, client))
     output = asyncio.run(agent.run("Fix it", RunContext(cwd=tmp_path, model="openai/other")))
 
     assert output == "Done."
@@ -112,7 +112,9 @@ def test_system_prompt_includes_agents_md_when_present(
     if conventions is not None:
         (tmp_path / "AGENTS.md").write_text(f"# Conventions\n\n{conventions}\n")
     client = ScriptedClient([_response([_message("ok")])])
-    asyncio.run(WebpAgent(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path)))
+    asyncio.run(
+        LeonScottKennedy(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path))
+    )
 
     instructions = client.responses.requests[0]["instructions"]
     assert str(tmp_path) in instructions
@@ -135,7 +137,9 @@ def test_malformed_tool_calls_are_reported_to_the_model(
     tmp_path: Path, call: dict[str, Any], expected: str
 ) -> None:
     client = ScriptedClient([_response([call]), _response([_message("ok")])])
-    asyncio.run(WebpAgent(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path)))
+    asyncio.run(
+        LeonScottKennedy(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path))
+    )
     assert expected in client.responses.requests[1]["input"][-1]["output"]
 
 
@@ -157,13 +161,13 @@ def test_each_iteration_appends_an_atif_step(tmp_path: Path) -> None:
             _response([_message("Done.")], _usage(200, 5, 150)),
         ]
     )
-    agent = WebpAgent(client=cast(AsyncOpenAI, client), trajectory_path=path)
+    agent = LeonScottKennedy(client=cast(AsyncOpenAI, client), trajectory_path=path)
     asyncio.run(agent.run("Fix it", RunContext(cwd=tmp_path)))
 
     trajectory = json.loads(path.read_text())
     steps = trajectory["steps"]
     assert trajectory["schema_version"] == "ATIF-v1.8"
-    assert trajectory["agent"]["name"] == "webp_agent"
+    assert trajectory["agent"]["name"] == "webp_leonscottkennedy"
     assert [step["step_id"] for step in steps] == [1, 2, 3, 4, 5]
     assert [step["source"] for step in steps] == ["system", "user", "agent", "agent", "agent"]
     assert steps[1]["message"] == "Fix it"
@@ -190,7 +194,7 @@ def test_trajectory_is_only_written_inside_harbor(
 ) -> None:
     def run_once() -> None:
         client = ScriptedClient([_response([_message("ok")])])
-        agent = WebpAgent(client=cast(AsyncOpenAI, client))
+        agent = LeonScottKennedy(client=cast(AsyncOpenAI, client))
         asyncio.run(agent.run("x", RunContext(cwd=tmp_path)))
 
     monkeypatch.delenv("AGENTS590_ATIF_PATH", raising=False)
@@ -214,7 +218,7 @@ def test_unwritable_trajectory_stops_the_run(tmp_path: Path) -> None:
     blocker = tmp_path / "not-a-directory"
     blocker.write_text("")
     client = ScriptedClient([_response([_message("Done.")])])
-    agent = WebpAgent(client=cast(AsyncOpenAI, client), trajectory_path=blocker / "t.json")
+    agent = LeonScottKennedy(client=cast(AsyncOpenAI, client), trajectory_path=blocker / "t.json")
 
     with pytest.raises(OSError):
         asyncio.run(agent.run("Fix it", RunContext(cwd=tmp_path)))
