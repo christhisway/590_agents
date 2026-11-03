@@ -29,14 +29,17 @@ REPO ?= $(AGENTS_DIR)
 BRANCH ?= agent/task
 REPO_DIR = $(abspath $(wildcard $(REPO)))
 WORKTREE = $(REPO_DIR)-$(subst /,-,$(BRANCH))
+# The frozen copy from `uv tool install`, not the editable .venv one that may come first on PATH.
+RUNNER = $(shell uv tool dir --bin)/agents590
 # The instruction verbatim (make would otherwise expand any $ in it), single-quoted for the shell.
 TASK_ARG = '$(subst ','\'',$(value TASK))'
 
 task:
 	@test -n "$(REPO_DIR)" -a -n "$(BRANCH)" -a -n $(TASK_ARG) \
 		|| { echo 'Usage: make task TASK="..." [REPO=<git repo>] [BRANCH=<new branch>]'; exit 2; }
+	@test -x $(RUNNER) || { echo 'No frozen runner; install it with: uv tool install $(AGENTS_DIR)'; exit 2; }
 	git -C $(REPO_DIR) worktree add $(WORKTREE) -b $(BRANCH)
-	agents590 webp_leonscottkennedy --cwd $(WORKTREE) --env-file $(AGENTS_DIR)/.env -i $(TASK_ARG)
+	$(RUNNER) webp_leonscottkennedy --cwd $(WORKTREE) --env-file $(AGENTS_DIR)/.env -i $(TASK_ARG)
 	@echo "Review the change in $(WORKTREE), then: make promote REPO=$(REPO) BRANCH=$(BRANCH)"
 
 # Commit the reviewed worktree, merge it into REPO's checked-out branch, and remove the

@@ -5,18 +5,29 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
-from openai import AsyncOpenAI
+from openai import APIConnectionError, AsyncOpenAI
 from openai.types.responses import Response
 
 from agents590 import atif
 from agents590.contracts import RunContext
-from agents590.webp_leonscottkennedy import LeonScottKennedy, run_shell
+from agents590.webp_leonscottkennedy import (
+    CONTINUE_PROMPT,
+    SELF_TEST_SCRIPT,
+    LeonScottKennedy,
+    run_shell,
+)
 
 
-def _response(output: list[dict[str, Any]], usage: dict[str, Any] | None = None) -> Response:
+def _response(
+    output: list[dict[str, Any]],
+    usage: dict[str, Any] | None = None,
+    fields: dict[str, Any] | None = None,
+) -> Response:
     return Response.model_validate(
         {
+            **(fields or {}),
             "id": "resp_test",
             "object": "response",
             "created_at": 0,
@@ -62,17 +73,20 @@ def _message(text: str) -> dict[str, Any]:
 
 
 class ScriptedResponses:
-    def __init__(self, responses: list[Response]) -> None:
+    def __init__(self, responses: list[Response | Exception]) -> None:
         self.responses = responses
         self.requests: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: object) -> Response:
         self.requests.append(json.loads(json.dumps(kwargs)))
-        return self.responses.pop(0)
+        result = self.responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class ScriptedClient:
-    def __init__(self, responses: list[Response]) -> None:
+    def __init__(self, responses: list[Response | Exception]) -> None:
         self.responses = ScriptedResponses(responses)
 
 
@@ -223,3 +237,65 @@ def test_unwritable_trajectory_stops_the_run(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         asyncio.run(agent.run("Fix it", RunContext(cwd=tmp_path)))
     assert client.responses.requests == []
+
+
+@pytest.mark.parametrize("own_repo", [False, True])
+def test_system_prompt_points_at_self_test_script_only_in_own_repo(
+    tmp_path: Path, own_repo: bool
+) -> None:
+    if own_repo:
+        (tmp_path / SELF_TEST_SCRIPT).parent.mkdir(parents=True)
+        (tmp_path / SELF_TEST_SCRIPT).write_text("")
+    client = ScriptedClient([_response([_message("ok")])])
+    agent = LeonScottKennedy(client=cast(AsyncOpenAI, client))
+    asyncio.run(agent.run("x", RunContext(cwd=tmp_path)))
+
+    assert (str(SELF_TEST_SCRIPT) in client.responses.requests[0]["instructions"]) == own_repo
+
+
+def test_api_errors_end_the_run_with_a_recorded_reason(tmp_path: Path) -> None:
+    path = tmp_path / "trajectory.json"
+    error = APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+    client = ScriptedClient([_response([_shell_call("call_1", "echo hi")]), error])
+    agent = LeonScottKennedy(client=cast(AsyncOpenAI, client), trajectory_path=path)
+    output = asyncio.run(agent.run("x", RunContext(cwd=tmp_path)))
+
+    assert output.startswith("Stopped early: the model request failed (APIConnectionError")
+    last = json.loads(path.read_text())["steps"][-1]
+    assert last["source"] == "system" and last["message"] == output
+
+
+def test_output_limit_cut_off_asks_the_model_to_continue(tmp_path: Path) -> None:
+    cut_off = {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
+    client = ScriptedClient(
+        [_response([_message("Half an ans")], fields=cut_off), _response([_message("Done.")])]
+    )
+    agent = LeonScottKennedy(client=cast(AsyncOpenAI, client))
+    output = asyncio.run(agent.run("x", RunContext(cwd=tmp_path)))
+
+    assert output == "Done."
+    assert client.responses.requests[1]["input"][-1] == {"role": "user", "content": CONTINUE_PROMPT}
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        (
+            {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}},
+            "incomplete (content_filter)",
+        ),
+        (
+            {"status": "failed", "error": {"code": "server_error", "message": "boom"}},
+            "failed (boom)",
+        ),
+    ],
+)
+def test_failed_or_filtered_responses_stop_without_running_tools(
+    tmp_path: Path, fields: dict[str, Any], expected: str
+) -> None:
+    client = ScriptedClient([_response([_shell_call("call_1", "touch ran")], fields=fields)])
+    agent = LeonScottKennedy(client=cast(AsyncOpenAI, client))
+    output = asyncio.run(agent.run("x", RunContext(cwd=tmp_path)))
+
+    assert expected in output
+    assert not (tmp_path / "ran").exists()

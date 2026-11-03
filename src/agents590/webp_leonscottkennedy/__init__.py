@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 from openai.types.responses import (
     FunctionToolParam,
     Response,
@@ -41,6 +41,17 @@ When the task is complete, reply with a short summary and no tool call."""
 # Repository conventions the agent should follow without being reminded in each instruction.
 PROJECT_INSTRUCTIONS_FILE = "AGENTS.md"
 
+# Present only in a checkout of this agent's own repository; the shared `make test` skips
+# the agent's tests, so the prompt points at this script whenever it exists under cwd.
+SELF_TEST_SCRIPT = Path("src/agents590/webp_leonscottkennedy/test.sh")
+SELF_TEST_NOTE = """
+
+This repository contains your own source code. To run the tests, use `{script}` in place \
+of `make test`; it also runs your own tests, which `make test` skips."""
+
+# Sent when a response is cut off at the output-token limit without calling a tool.
+CONTINUE_PROMPT = "Your previous response was cut off at the output limit. Continue the task."
+
 
 # added this on AI suggestion to improve token efficiency. keeps the first and last 10k chars of a
 # long shell output
@@ -54,8 +65,10 @@ def _truncate(text: str) -> str:
 
 
 def _system_prompt(cwd: Path) -> str:
-    """Append the working directory's AGENTS.md, if any, to the base prompt."""
+    """Append the self-test note and the working directory's AGENTS.md, when present."""
     prompt = SYSTEM_PROMPT.format(cwd=cwd)
+    if (cwd / SELF_TEST_SCRIPT).is_file():
+        prompt += SELF_TEST_NOTE.format(script=SELF_TEST_SCRIPT)
     path = cwd / PROJECT_INSTRUCTIONS_FILE
     if not path.is_file():
         return prompt
@@ -215,6 +228,26 @@ def _record_response(
     recorder.add("agent", response.output_text, **fields)
 
 
+def _stop_reason(response: Response) -> str | None:
+    """Explain a response that must end the run; a max_output_tokens cut-off can continue."""
+    if response.status == "failed":
+        detail = response.error.message if response.error is not None else "no details"
+        return f"the model response failed ({detail})"
+    if response.status == "incomplete":
+        details = response.incomplete_details
+        reason = details.reason if details is not None else None
+        if reason != "max_output_tokens":
+            return f"the model response was incomplete ({reason or 'unknown reason'})"
+    return None
+
+
+def _stop(recorder: ATIFRecorder, reason: str) -> str:
+    """Record why the run ended early and return that as the final output."""
+    message = f"Stopped early: {reason}."
+    recorder.add("system", message)
+    return message
+
+
 class LeonScottKennedy:
     """Loop between the model and a shell tool until the model stops calling tools."""
 
@@ -248,12 +281,25 @@ class LeonScottKennedy:
         recorder.add("user", instruction)
         transcript: list[ResponseInputItemParam] = [{"role": "user", "content": instruction}]
         for _ in range(MAX_STEPS):
-            response = await _request(client, model, system_prompt, transcript)
+            try:
+                response = await _request(client, model, system_prompt, transcript)
+            except APIError as error:
+                # Covers context overflow, exhausted retries, and connection failures.
+                failure = f"{type(error).__name__}: {error}"
+                return _stop(recorder, f"the model request failed ({failure})")
+            # Don't run tool calls from a failed or filtered response.
+            if (reason := _stop_reason(response)) is not None:
+                _record_response(recorder, response, [])
+                return _stop(recorder, reason)
             calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
             outputs = await _run_calls(calls, context.cwd)
             transcript += [_as_input(item) for item in response.output]
             transcript += [_call_output(call_id, output) for call_id, output in outputs]
             _record_response(recorder, response, outputs)
-            if not calls:
+            if not calls and response.status == "incomplete":
+                # Cut off at max_output_tokens: the text so far isn't a final answer.
+                transcript.append({"role": "user", "content": CONTINUE_PROMPT})
+                recorder.add("user", CONTINUE_PROMPT)
+            elif not calls:
                 return response.output_text
         return f"Stopped after reaching the {MAX_STEPS}-step limit."
