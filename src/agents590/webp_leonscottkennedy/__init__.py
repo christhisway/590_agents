@@ -21,6 +21,8 @@ from agents590.atif import ATIFRecorder, JSONValue
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
 
+from . import skills
+
 MAX_STEPS = 50
 MAX_STEPS_ENV = "AGENTS590_MAX_STEPS"
 COMMAND_TIMEOUT_SECONDS = 120.0
@@ -78,11 +80,12 @@ def _truncate(text: str) -> str:
     return f"{text[:half]}\n... [{omitted} characters omitted] ...\n{text[-half:]}"
 
 
-def _system_prompt(cwd: Path) -> str:
-    """Append the self-test note and the working directory's AGENTS.md, when present."""
+def _system_prompt(cwd: Path, found: list[skills.Skill]) -> str:
+    """Append the self-test note, skill catalog, and the working directory's AGENTS.md."""
     prompt = SYSTEM_PROMPT.format(cwd=cwd)
     if (cwd / SELF_TEST_SCRIPT).is_file():
         prompt += SELF_TEST_NOTE.format(script=SELF_TEST_SCRIPT)
+    prompt += skills.catalog(found)
     path = cwd / PROJECT_INSTRUCTIONS_FILE
     if not path.is_file():
         return prompt
@@ -158,7 +161,48 @@ SHELL = Tool(
     run=_shell,
 )
 
-TOOLS: dict[str, Tool] = {tool.schema["name"]: tool for tool in [SHELL]}
+
+def _skill_tool(found: list[skills.Skill]) -> Tool:
+    """Load a skill's instructions by name, once per run; the schema lists only real skills."""
+    by_name = {skill.name: skill for skill in found}
+    activated: set[str] = set()
+
+    async def activate(arguments: dict[str, Any], cwd: Path) -> str:
+        name = arguments.get("name")
+        if not isinstance(name, str) or name not in by_name:
+            return f"Unknown skill {name!r}; available skills: {', '.join(by_name)}."
+        if name in activated:
+            return f"Skill {name!r} is already active; its instructions are above."
+        activated.add(name)
+        return skills.activate(by_name[name])
+
+    return Tool(
+        schema={
+            "type": "function",
+            "name": "activate_skill",
+            "description": "Load a skill's full instructions and list its bundled files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": list(by_name),
+                        "description": "The name of the skill to activate.",
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+        run=activate,
+    )
+
+
+def _tools(found: list[skills.Skill]) -> dict[str, Tool]:
+    """The shell, plus the skill tool when there are skills to activate."""
+    tools = [SHELL, _skill_tool(found)] if found else [SHELL]
+    return {tool.schema["name"]: tool for tool in tools}
 
 
 def _json_object(text: str) -> dict[str, Any] | None:
@@ -169,10 +213,10 @@ def _json_object(text: str) -> dict[str, Any] | None:
     return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else None
 
 
-async def _call_tool(name: str, arguments: str, cwd: Path) -> str:
-    tool = TOOLS.get(name)
+async def _call_tool(tools: dict[str, Tool], name: str, arguments: str, cwd: Path) -> str:
+    tool = tools.get(name)
     if tool is None:
-        return f"Unknown tool {name!r}; available tools: {', '.join(TOOLS)}."
+        return f"Unknown tool {name!r}; available tools: {', '.join(tools)}."
     parsed = _json_object(arguments)
     if parsed is None:
         return "Invalid arguments; expected a JSON object."
@@ -180,23 +224,31 @@ async def _call_tool(name: str, arguments: str, cwd: Path) -> str:
 
 
 async def _request(
-    client: AsyncOpenAI, model: str, system_prompt: str, transcript: list[ResponseInputItemParam]
+    client: AsyncOpenAI,
+    model: str,
+    system_prompt: str,
+    tools: dict[str, Tool],
+    transcript: list[ResponseInputItemParam],
 ) -> Response:
     """Ask for the next turn statelessly, carrying encrypted reasoning in the transcript."""
     return await client.responses.create(
         model=model,
         instructions=system_prompt,
         input=transcript,
-        tools=[tool.schema for tool in TOOLS.values()],
+        tools=[tool.schema for tool in tools.values()],
         include=["reasoning.encrypted_content"],
         store=False,
         background=False,
     )
 
 
-async def _run_calls(calls: list[ResponseFunctionToolCall], cwd: Path) -> list[tuple[str, str]]:
+async def _run_calls(
+    tools: dict[str, Tool], calls: list[ResponseFunctionToolCall], cwd: Path
+) -> list[tuple[str, str]]:
     """Run each tool call in order and pair its output with the call's id."""
-    return [(call.call_id, await _call_tool(call.name, call.arguments, cwd)) for call in calls]
+    return [
+        (call.call_id, await _call_tool(tools, call.name, call.arguments, cwd)) for call in calls
+    ]
 
 
 def _as_input(item: ResponseOutputItem) -> ResponseInputItemParam:
@@ -272,7 +324,7 @@ def _stop(recorder: ATIFRecorder, reason: str) -> str:
 
 
 class LeonScottKennedy:
-    """Loop between the model and a shell tool until the model stops calling tools."""
+    """Loop between the model and its tools until the model stops calling them."""
 
     def __init__(
         self, client: AsyncOpenAI | None = None, trajectory_path: Path | None = None
@@ -304,14 +356,16 @@ class LeonScottKennedy:
         context: RunContext,
         max_steps: int,
     ) -> str:
-        system_prompt = _system_prompt(context.cwd)
+        found = skills.discover(context.cwd)
+        system_prompt = _system_prompt(context.cwd, found)
+        tools = _tools(found)
         recorder = self._recorder(model)
         recorder.add("system", system_prompt)
         recorder.add("user", instruction)
         transcript: list[ResponseInputItemParam] = [{"role": "user", "content": instruction}]
         for _ in range(max_steps):
             try:
-                response = await _request(client, model, system_prompt, transcript)
+                response = await _request(client, model, system_prompt, tools, transcript)
             except APIError as error:
                 # Covers context overflow, exhausted retries, and connection failures.
                 failure = f"{type(error).__name__}: {error}"
@@ -321,7 +375,7 @@ class LeonScottKennedy:
                 _record_response(recorder, response, [])
                 return _stop(recorder, reason)
             calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
-            outputs = await _run_calls(calls, context.cwd)
+            outputs = await _run_calls(tools, calls, context.cwd)
             transcript += [_as_input(item) for item in response.output]
             transcript += [_call_output(call_id, output) for call_id, output in outputs]
             _record_response(recorder, response, outputs)

@@ -19,6 +19,7 @@ from agents590.webp_leonscottkennedy import (
     SELF_TEST_SCRIPT,
     LeonScottKennedy,
     run_shell,
+    skills,
 )
 
 
@@ -365,3 +366,63 @@ def test_invalid_step_limit_is_rejected(
             LeonScottKennedy(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path))
         )
     assert client.responses.requests == []
+
+
+@pytest.mark.parametrize("project_skill", [False, True])
+def test_system_prompt_lists_skills_before_agents_md(tmp_path: Path, project_skill: bool) -> None:
+    location = tmp_path / ".agents/skills/pdf/SKILL.md"
+    if project_skill:
+        location.parent.mkdir(parents=True)
+        location.write_text("---\nname: pdf\ndescription: Merge PDFs.\n---\n")
+    (tmp_path / "AGENTS.md").write_text("Conventions.")
+    client = ScriptedClient([_response([_message("ok")])])
+    asyncio.run(
+        LeonScottKennedy(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path))
+    )
+
+    instructions = client.responses.requests[0]["instructions"]
+    assert "<name>create-skill</name>" in instructions
+    assert ("<name>pdf</name>" in instructions) == project_skill
+    assert instructions.index("</available_skills>") < instructions.index("Conventions.")
+
+
+def test_system_prompt_omits_catalog_without_skills(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(skills, "BUNDLED_SKILLS", tmp_path / "none")
+    client = ScriptedClient([_response([_message("ok")])])
+    asyncio.run(
+        LeonScottKennedy(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path))
+    )
+
+    request = client.responses.requests[0]
+    assert "skill" not in request["instructions"]
+    assert [tool["name"] for tool in request["tools"]] == ["shell"]
+
+
+def _activate_call(call_id: str, name: str) -> dict[str, Any]:
+    return {
+        **_shell_call(call_id, ""),
+        "name": "activate_skill",
+        "arguments": json.dumps({"name": name}),
+    }
+
+
+def test_activate_skill_tool_loads_each_skill_once(tmp_path: Path) -> None:
+    client = ScriptedClient(
+        [
+            _response([_activate_call("call_1", "create-skill")]),
+            _response([_activate_call("call_2", "create-skill"), _activate_call("call_3", "nope")]),
+            _response([_message("Done.")]),
+        ]
+    )
+    agent = LeonScottKennedy(client=cast(AsyncOpenAI, client))
+    asyncio.run(agent.run("Write a skill", RunContext(cwd=tmp_path)))
+
+    first, second, third = client.responses.requests
+    (tool,) = [tool for tool in first["tools"] if tool["name"] == "activate_skill"]
+    assert tool["parameters"]["properties"]["name"]["enum"] == ["create-skill"]
+    assert second["input"][-1]["output"].startswith('<skill_content name="create-skill">')
+    repeated, unknown = third["input"][-2:]
+    assert "already active" in repeated["output"]
+    assert "Unknown skill 'nope'; available skills: create-skill." == unknown["output"]
