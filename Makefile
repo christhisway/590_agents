@@ -1,4 +1,4 @@
-.PHONY: setup check test smoke clean task promote
+.PHONY: setup check test smoke clean task promote runner
 
 setup:
 	uv sync --locked
@@ -23,7 +23,7 @@ clean:
 # Run the installed (frozen) webp_leonscottkennedy in a fresh worktree of a git repo, then review it:
 #   make task TASK="Add an exact-match edit tool"    (this repo, branch agent/task)
 #   make task REPO=~/development/foo BRANCH=agent/fix-x TASK="Fix the failing date parser"
-# Install the frozen runner once with `uv tool install --reinstall .`; promote refreshes it.
+# Install or refresh the frozen runner with `make runner` after committing agent changes.
 AGENTS_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 REPO ?= $(AGENTS_DIR)
 BRANCH ?= agent/task
@@ -37,21 +37,34 @@ TASK_ARG = '$(subst ','\'',$(value TASK))'
 task:
 	@test -n "$(REPO_DIR)" -a -n "$(BRANCH)" -a -n $(TASK_ARG) \
 		|| { echo 'Usage: make task TASK="..." [REPO=<git repo>] [BRANCH=<new branch>]'; exit 2; }
-	@test -x $(RUNNER) || { echo 'No frozen runner; install it with: uv tool install $(AGENTS_DIR)'; exit 2; }
+	@test -x $(RUNNER) || { echo 'No frozen runner; install it with: make runner'; exit 2; }
 	git -C $(REPO_DIR) worktree add $(WORKTREE) -b $(BRANCH)
 	$(RUNNER) webp_leonscottkennedy --cwd $(WORKTREE) --env-file $(AGENTS_DIR)/.env -i $(TASK_ARG)
 	@echo "Review the change in $(WORKTREE), then: make promote REPO=$(REPO) BRANCH=$(BRANCH)"
 
-# Commit the reviewed worktree, merge it into REPO's checked-out branch, and remove the
-# worktree. Reinstalls the frozen runner when the agent worked on this repository.
+# Apply a reviewed worktree's changes to REPO's working files without committing, then remove
+# the worktree and its branch. Promote several tasks, then commit them together. If a patch
+# overlaps earlier changes, the files it touches are staged and merged three ways.
 promote:
 	@test -n "$(REPO_DIR)" -a -n "$(BRANCH)" \
-		|| { echo 'Usage: make promote [REPO=<git repo>] [BRANCH=<branch>] [MSG="..."]'; exit 2; }
+		|| { echo 'Usage: make promote [REPO=<git repo>] [BRANCH=<branch>]'; exit 2; }
+	@test -d $(WORKTREE) || { echo 'No worktree at $(WORKTREE)'; exit 2; }
 	git -C $(WORKTREE) add -A
-	git -C $(WORKTREE) diff --cached --quiet \
-		|| git -C $(WORKTREE) commit -m "$${MSG:-Agent task on $(BRANCH)}"
-	git -C $(REPO_DIR) merge $(BRANCH)
-	git -C $(REPO_DIR) worktree remove $(WORKTREE)
-	git -C $(REPO_DIR) branch -d $(BRANCH)
-	if [ "$(REPO_DIR)" = "$(AGENTS_DIR)" ]; then uv tool install --force --reinstall $(AGENTS_DIR); fi
+	@# Everything since the task started (uncommitted edits and any commits the agent made).
+	@patch=$$(mktemp) \
+		&& base=$$(git -C $(WORKTREE) merge-base HEAD $$(git -C $(REPO_DIR) rev-parse HEAD)) \
+		&& git -C $(WORKTREE) diff --cached --binary $$base > $$patch \
+		&& if [ ! -s $$patch ]; then echo 'No changes to apply.'; \
+		elif git -C $(REPO_DIR) apply $$patch 2>/dev/null; then echo 'Applied; changes are uncommitted.'; \
+		elif (cd $(REPO_DIR) && for f in $$(git apply --numstat $$patch | cut -f3); do \
+				[ -e "$$f" ] && git add -- "$$f"; done; git apply --3way $$patch); then \
+			echo 'Applied with a three-way merge; the files it touched are staged.'; \
+		else rm -f $$patch; echo 'Conflicts: resolve the markers in $(REPO_DIR) and git add the files, then run:'; \
+			echo '  git -C $(REPO_DIR) worktree remove --force $(WORKTREE) && git -C $(REPO_DIR) branch -D $(BRANCH)'; \
+			exit 1; fi; rm -f $$patch
+	git -C $(REPO_DIR) worktree remove --force $(WORKTREE)
+	git -C $(REPO_DIR) branch -D $(BRANCH)
 
+# Rebuild the frozen runner from this checkout; run it after committing promoted changes.
+runner:
+	uv tool install --force --reinstall $(AGENTS_DIR)

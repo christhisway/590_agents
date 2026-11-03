@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,9 +22,21 @@ from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
 
 MAX_STEPS = 50
+MAX_STEPS_ENV = "AGENTS590_MAX_STEPS"
 COMMAND_TIMEOUT_SECONDS = 120.0
 MAX_OUTPUT_CHARS = 20_000
 REQUEST_TIMEOUT_SECONDS = 300.0
+
+
+def _configured_max_steps() -> int:
+    """Read the step limit, requiring an explicitly positive integer when set."""
+    value = os.environ.get(MAX_STEPS_ENV)
+    if value is None:
+        return MAX_STEPS
+    if not value.isdecimal() or int(value) <= 0:
+        raise ValueError(f"{MAX_STEPS_ENV} must be a positive integer; got {value!r}.")
+    return int(value)
+
 
 # not sure if this is even necessary but it couldn't hurt
 SYSTEM_PROMPT = """\
@@ -88,11 +102,18 @@ async def run_shell(command: str, cwd: Path, timeout: float = COMMAND_TIMEOUT_SE
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
     except TimeoutError:
-        process.kill()
+        # The shell can have spawned children (for example, pytest).  Put each
+        # command in its own session so that a timeout cannot leave those
+        # children running after the shell is killed.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         await process.wait()
         return f"Command timed out after {timeout:g} seconds."
     return _truncate(
@@ -258,14 +279,15 @@ class LeonScottKennedy:
         self._trajectory_path = trajectory_path
 
     async def run(self, instruction: str, context: RunContext) -> str:
+        max_steps = _configured_max_steps()
         settings = UNCOpenAISettings.from_env(model=context.model)
         # if client exists start loop
         if self._client is not None:
-            return await self._loop(self._client, settings.model, instruction, context)
+            return await self._loop(self._client, settings.model, instruction, context, max_steps)
         # otherwise make a client w proper cleanup
         async with settings.create_async_client() as client:
             patient = client.with_options(timeout=REQUEST_TIMEOUT_SECONDS, max_retries=2)
-            return await self._loop(patient, settings.model, instruction, context)
+            return await self._loop(patient, settings.model, instruction, context, max_steps)
 
     def _recorder(self, model: str) -> ATIFRecorder:
         if self._trajectory_path is not None:
@@ -273,14 +295,19 @@ class LeonScottKennedy:
         return ATIFRecorder.from_environment(agent="webp_leonscottkennedy", model=model)
 
     async def _loop(
-        self, client: AsyncOpenAI, model: str, instruction: str, context: RunContext
+        self,
+        client: AsyncOpenAI,
+        model: str,
+        instruction: str,
+        context: RunContext,
+        max_steps: int,
     ) -> str:
         system_prompt = _system_prompt(context.cwd)
         recorder = self._recorder(model)
         recorder.add("system", system_prompt)
         recorder.add("user", instruction)
         transcript: list[ResponseInputItemParam] = [{"role": "user", "content": instruction}]
-        for _ in range(MAX_STEPS):
+        for _ in range(max_steps):
             try:
                 response = await _request(client, model, system_prompt, transcript)
             except APIError as error:
@@ -302,4 +329,4 @@ class LeonScottKennedy:
                 recorder.add("user", CONTINUE_PROMPT)
             elif not calls:
                 return response.output_text
-        return f"Stopped after reaching the {MAX_STEPS}-step limit."
+        return f"Stopped after reaching the {max_steps}-step limit."

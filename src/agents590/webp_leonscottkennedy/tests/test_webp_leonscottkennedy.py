@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -138,6 +140,25 @@ def test_system_prompt_includes_agents_md_when_present(
         assert instructions.endswith(f"# Conventions\n\n{conventions}")
 
 
+@pytest.mark.parametrize("contents", ["", "\n  \t\n"])
+def test_empty_agents_md_adds_nothing_to_system_prompt(tmp_path: Path, contents: str) -> None:
+    baseline_client = ScriptedClient([_response([_message("ok")])])
+    asyncio.run(
+        LeonScottKennedy(client=cast(AsyncOpenAI, baseline_client)).run(
+            "x", RunContext(cwd=tmp_path)
+        )
+    )
+    baseline = baseline_client.responses.requests[0]["instructions"]
+
+    (tmp_path / "AGENTS.md").write_text(contents)
+    client = ScriptedClient([_response([_message("ok")])])
+    asyncio.run(
+        LeonScottKennedy(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path))
+    )
+
+    assert client.responses.requests[0]["instructions"] == baseline
+
+
 @pytest.mark.parametrize(
     ("call", "expected"),
     [
@@ -161,6 +182,25 @@ def test_run_shell_reports_failures_and_timeouts(tmp_path: Path) -> None:
     failed = asyncio.run(run_shell("echo oops >&2; exit 3", tmp_path))
     assert "exit_code: 3" in failed and "oops" in failed
     assert "timed out" in asyncio.run(run_shell("sleep 5", tmp_path, timeout=0.1))
+
+
+def test_run_shell_timeout_kills_child_process(tmp_path: Path) -> None:
+    pid_path = tmp_path / "child.pid"
+    result = asyncio.run(
+        run_shell(f"sleep 30 & child=$!; echo $child > {pid_path}; wait", tmp_path, timeout=0.1)
+    )
+    assert "timed out" in result
+
+    child_pid = int(pid_path.read_text())
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("child process survived the shell timeout")
 
 
 def test_each_iteration_appends_an_atif_step(tmp_path: Path) -> None:
@@ -299,3 +339,29 @@ def test_failed_or_filtered_responses_stop_without_running_tools(
 
     assert expected in output
     assert not (tmp_path / "ran").exists()
+
+
+def test_step_limit_comes_from_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AGENTS590_MAX_STEPS", "1")
+    client = ScriptedClient([_response([_shell_call("call_1", "echo hi")])])
+
+    output = asyncio.run(
+        LeonScottKennedy(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path))
+    )
+
+    assert output == "Stopped after reaching the 1-step limit."
+    assert len(client.responses.requests) == 1
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "one", "1.5"])
+def test_invalid_step_limit_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str
+) -> None:
+    monkeypatch.setenv("AGENTS590_MAX_STEPS", value)
+    client = ScriptedClient([])
+
+    with pytest.raises(ValueError, match="AGENTS590_MAX_STEPS must be a positive integer"):
+        asyncio.run(
+            LeonScottKennedy(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path))
+        )
+    assert client.responses.requests == []
