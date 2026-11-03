@@ -105,6 +105,23 @@ def test_loop_runs_shell_calls_in_cwd_and_returns_final_text(tmp_path: Path) -> 
     assert str(tmp_path) in tool_result["output"]
 
 
+@pytest.mark.parametrize("conventions", [None, "Run `make check` after every change."])
+def test_system_prompt_includes_agents_md_when_present(
+    tmp_path: Path, conventions: str | None
+) -> None:
+    if conventions is not None:
+        (tmp_path / "AGENTS.md").write_text(f"# Conventions\n\n{conventions}\n")
+    client = ScriptedClient([_response([_message("ok")])])
+    asyncio.run(WebpAgent(client=cast(AsyncOpenAI, client)).run("x", RunContext(cwd=tmp_path)))
+
+    instructions = client.responses.requests[0]["instructions"]
+    assert str(tmp_path) in instructions
+    if conventions is None:
+        assert "AGENTS.md" not in instructions
+    else:
+        assert instructions.endswith(f"# Conventions\n\n{conventions}")
+
+
 @pytest.mark.parametrize(
     ("call", "expected"),
     [

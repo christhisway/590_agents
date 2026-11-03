@@ -38,6 +38,9 @@ the task requires and preserve unrelated content exactly.
 Before finishing, verify your change by running it or its tests where possible. \
 When the task is complete, reply with a short summary and no tool call."""
 
+# Repository conventions the agent should follow without being reminded in each instruction.
+PROJECT_INSTRUCTIONS_FILE = "AGENTS.md"
+
 
 # added this on AI suggestion to improve token efficiency. keeps the first and last 10k chars of a
 # long shell output
@@ -48,6 +51,19 @@ def _truncate(text: str) -> str:
     half = MAX_OUTPUT_CHARS // 2
     omitted = len(text) - MAX_OUTPUT_CHARS
     return f"{text[:half]}\n... [{omitted} characters omitted] ...\n{text[-half:]}"
+
+
+def _system_prompt(cwd: Path) -> str:
+    """Append the working directory's AGENTS.md, if any, to the base prompt."""
+    prompt = SYSTEM_PROMPT.format(cwd=cwd)
+    path = cwd / PROJECT_INSTRUCTIONS_FILE
+    if not path.is_file():
+        return prompt
+    instructions = _truncate(path.read_text(errors="replace").strip())
+    return (
+        f"{prompt}\n\nThe project's {PROJECT_INSTRUCTIONS_FILE} follows. Treat it as standing "
+        f"instructions for every change you make.\n\n{instructions}"
+    )
 
 
 async def run_shell(command: str, cwd: Path, timeout: float = COMMAND_TIMEOUT_SECONDS) -> str:
@@ -226,7 +242,7 @@ class WebpAgent:
     async def _loop(
         self, client: AsyncOpenAI, model: str, instruction: str, context: RunContext
     ) -> str:
-        system_prompt = SYSTEM_PROMPT.format(cwd=context.cwd)
+        system_prompt = _system_prompt(context.cwd)
         recorder = self._recorder(model)
         recorder.add("system", system_prompt)
         recorder.add("user", instruction)
