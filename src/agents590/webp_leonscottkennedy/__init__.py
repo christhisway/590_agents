@@ -87,6 +87,8 @@ def _system_prompt(cwd: Path) -> str:
     if not path.is_file():
         return prompt
     instructions = _truncate(path.read_text(errors="replace").strip())
+    if not instructions:
+        return prompt
     return (
         f"{prompt}\n\nThe project's {PROJECT_INSTRUCTIONS_FILE} follows. Treat it as standing "
         f"instructions for every change you make.\n\n{instructions}"
